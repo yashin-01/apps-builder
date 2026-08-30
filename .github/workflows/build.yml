@@ -1,0 +1,298 @@
+name: iOS Capacitor Build Engine
+
+on:
+  repository_dispatch:
+    types: [build, build-app]
+  workflow_dispatch:
+    inputs:
+      app_repo:
+        description: 'Target Application Repository (owner/repo)'
+        required: true
+      app_key:
+        description: 'Application Key Identifier'
+        required: false
+        default: 'app'
+      app_desc:
+        description: 'Application Description'
+        required: false
+        default: 'Mobile Application'
+      dev_name:
+        description: 'Developer Name'
+        required: false
+        default: 'Developer'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dist-repo-push
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Initialize environment & configurations
+        id: config
+        env:
+          PAYLOAD_REPO: ${{ github.event.client_payload.app_repo }}
+          PAYLOAD_KEY: ${{ github.event.client_payload.app_key }}
+          PAYLOAD_DESC: ${{ github.event.client_payload.app_desc }}
+          PAYLOAD_DEV: ${{ github.event.client_payload.dev_name }}
+          INPUT_REPO: ${{ github.event.inputs.app_repo }}
+          INPUT_KEY: ${{ github.event.inputs.app_key }}
+          INPUT_DESC: ${{ github.event.inputs.app_desc }}
+          INPUT_DEV: ${{ github.event.inputs.dev_name }}
+          DIST_REPO_SEC: ${{ secrets.DIST_REPO }}
+        run: |
+          # Resolver repositorio objetivo desde el payload o input
+          APP_REPO="${PAYLOAD_REPO:-$INPUT_REPO}"
+          APP_KEY="${PAYLOAD_KEY:-${INPUT_KEY:-app}}"
+          APP_DESC="${PAYLOAD_DESC:-${INPUT_DESC:-Mobile Application}}"
+          DEV_NAME="${PAYLOAD_DEV:-${INPUT_DEV:-Developer}}"
+          DIST_REPO="$DIST_REPO_SEC"
+
+          if [ -z "$APP_REPO" ]; then
+            echo "::error::Target repository not specified."
+            exit 1
+          fi
+
+          if [ -z "$DIST_REPO" ]; then
+            echo "::error::Distribution repository secret (DIST_REPO) not configured."
+            exit 1
+          fi
+
+          # Enmascarar información sensible en los logs públicos
+          echo "::add-mask::$APP_REPO"
+          echo "::add-mask::$DIST_REPO"
+          echo "::add-mask::${{ github.actor }}"
+
+          echo "app_repo=$APP_REPO" >> "$GITHUB_OUTPUT"
+          echo "app_key=$APP_KEY" >> "$GITHUB_OUTPUT"
+          echo "app_desc=$APP_DESC" >> "$GITHUB_OUTPUT"
+          echo "dev_name=$DEV_NAME" >> "$GITHUB_OUTPUT"
+          echo "dist_repo=$DIST_REPO" >> "$GITHUB_OUTPUT"
+          echo "Pipeline configuration initialized successfully."
+
+      - name: Prepare build environment
+        uses: actions/checkout@v4
+        with:
+          path: builder-tools
+
+      - name: Fetch target workspace
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.config.outputs.app_repo }}
+          token: ${{ secrets.GH_PAT }}
+          path: app-src
+
+      - name: Setup Node runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies & compile web bundle
+        run: |
+          cd app-src
+          npm install
+          if grep -q '"build":' package.json; then
+            echo "Building web assets..."
+            npm run build
+          fi
+
+      - name: Setup ML Toolchain (Conditional)
+        if: hashFiles('app-src/.github/scripts/convert.py') != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Process ML models (Conditional)
+        if: hashFiles('app-src/.github/scripts/convert.py') != ''
+        run: |
+          cd app-src
+          pip install coremltools torch
+          gem install xcodeproj
+          python .github/scripts/convert.py models/class_mapping.json models/glyph_model.pth ios/App/GlyphBroadcastExtension/GlyphModel.mlmodel
+          ruby .github/scripts/add_model.rb
+
+      - name: Sync native platform
+        run: |
+          cd app-src
+          npx cap sync ios
+
+      - name: Resolve application metadata & assets
+        id: meta
+        run: |
+          cd app-src
+          RAW_NAME=$(jq -r '.appName // "App"' capacitor.config.json)
+          APP_ID=$(jq -r '.appId // "com.app.release"' capacitor.config.json)
+          
+          # Limpiar nombre para empaquetado
+          APP_NAME=$(echo "$RAW_NAME" | tr -dc '[:alnum:]_')
+          if [ -z "$APP_NAME" ]; then APP_NAME="App"; fi
+
+          # Tag prefix estándar
+          TAG_PREFIX=$(echo "${{ steps.config.outputs.app_key }}-v" | tr '[:upper:]' '[:lower:]')
+
+          # Localizar icono
+          ICON_PATH=""
+          if [ -f "public/icon.png" ]; then
+            ICON_PATH="public/icon.png"
+          elif [ -f "icon.png" ]; then
+            ICON_PATH="icon.png"
+          fi
+
+          if [ -n "$ICON_PATH" ]; then
+            sips -s format png -z 1024 1024 "$ICON_PATH" \
+              --out ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-512@2x.png 2>/dev/null || true
+          fi
+
+          echo "app_name=$APP_NAME" >> "$GITHUB_OUTPUT"
+          echo "raw_name=$RAW_NAME" >> "$GITHUB_OUTPUT"
+          echo "app_id=$APP_ID" >> "$GITHUB_OUTPUT"
+          echo "tag_prefix=$TAG_PREFIX" >> "$GITHUB_OUTPUT"
+          echo "icon_path=$ICON_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Compute release versioning
+        id: vars
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          DIST: ${{ steps.config.outputs.dist_repo }}
+          TAG_P: ${{ steps.meta.outputs.tag_prefix }}
+        run: |
+          MAX_BUILD=$(gh api "repos/${DIST}/releases" --paginate 2>/dev/null | jq -r \
+            --arg p "$TAG_P" '
+            [.[] | select(.tag_name | startswith($p))]
+            | map(.tag_name | ltrimstr($p) | split(".") | last | tonumber)
+            | max // 0
+          ' 2>/dev/null || echo "0")
+
+          if [ -z "$MAX_BUILD" ] || [ "$MAX_BUILD" = "null" ] || [ "$MAX_BUILD" -le 0 ] 2>/dev/null; then
+            BUILD_NUM=${{ github.run_number }}
+          else
+            BUILD_NUM=$(( MAX_BUILD + 1 ))
+          fi
+
+          echo "build_number=$BUILD_NUM" >> "$GITHUB_OUTPUT"
+          echo "version=1.0.${BUILD_NUM}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG_P}1.0.${BUILD_NUM}" >> "$GITHUB_OUTPUT"
+
+      - name: Compile native binaries
+        run: |
+          cd app-src/ios/App
+          xcodebuild -project App.xcodeproj \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            MARKETING_VERSION=${{ steps.vars.outputs.version }} \
+            CURRENT_PROJECT_VERSION=${{ steps.vars.outputs.build_number }} \
+            clean build
+
+      - name: Package distribution bundle
+        id: package
+        run: |
+          mkdir -p Payload
+          cp -r app-src/ios/App/build/Build/Products/Release-iphoneos/App.app Payload/
+          zip -r "${{ steps.meta.outputs.app_name }}.ipa" Payload
+          FILE_SIZE=$(stat -f%z "${{ steps.meta.outputs.app_name }}.ipa" 2>/dev/null || stat -c%s "${{ steps.meta.outputs.app_name }}.ipa" 2>/dev/null || echo 0)
+          echo "size=$FILE_SIZE" >> "$GITHUB_OUTPUT"
+
+      - name: Access distribution channel
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.config.outputs.dist_repo }}
+          token: ${{ secrets.GH_PAT }}
+          path: dist-repo
+
+      - name: Publish distribution release
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          DIST: ${{ steps.config.outputs.dist_repo }}
+        run: |
+          gh release create "${{ steps.vars.outputs.tag }}" \
+            "${{ steps.meta.outputs.app_name }}.ipa" \
+            --repo "$DIST" \
+            --title "${{ steps.meta.outputs.raw_name }} v${{ steps.vars.outputs.version }}" \
+            --notes "Automated CI/CD build package"
+
+      - name: Update distribution catalog & manifests
+        run: |
+          KEY="${{ steps.config.outputs.app_key }}"
+          DIST="${{ steps.config.outputs.dist_repo }}"
+          DEV="${{ steps.config.outputs.dev_name }}"
+          DESC="${{ steps.config.outputs.app_desc }}"
+          ICON_SRC="app-src/${{ steps.meta.outputs.icon_path }}"
+
+          mkdir -p dist-repo/icons
+          if [ -f "$ICON_SRC" ]; then
+            cp "$ICON_SRC" "dist-repo/icons/${KEY}.png" || true
+          fi
+
+          cat > /tmp/app-entry.json <<EOF
+          {
+            "name": "${{ steps.meta.outputs.raw_name }}",
+            "bundleIdentifier": "${{ steps.meta.outputs.app_id }}",
+            "developerName": "${DEV}",
+            "version": "${{ steps.vars.outputs.version }}",
+            "versionDate": "${{ steps.vars.outputs.date }}",
+            "downloadURL": "https://github.com/${DIST}/releases/download/${{ steps.vars.outputs.tag }}/${{ steps.meta.outputs.app_name }}.ipa",
+            "size": ${{ steps.package.outputs.size || 0 }},
+            "localizedDescription": "${DESC}",
+            "iconURL": "https://raw.githubusercontent.com/${DIST}/main/icons/${KEY}.png"
+          }
+          EOF
+
+          node builder-tools/scripts/merge-source.mjs dist-repo/source.json /tmp/app-entry.json
+
+      - name: Push distribution updates
+        run: |
+          cd dist-repo
+          git config user.name "actions-runner[bot]"
+          git config user.email "actions-runner[bot]@users.noreply.github.com"
+          git add source.json icons/ || true
+          git commit -m "chore(${{ steps.config.outputs.app_key }}): update to v${{ steps.vars.outputs.version }}" || echo "No changes"
+
+          for i in 1 2 3 4 5; do
+            git fetch origin main
+            if git rebase origin/main; then
+              if git -c http.https://github.com/.extraheader="" push https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ steps.config.outputs.dist_repo }}.git HEAD:main; then
+                echo "Distribution push completed successfully."
+                exit 0
+              fi
+            else
+              git rebase --abort || true
+            fi
+            sleep 5
+          done
+
+      - name: Prune deprecated releases
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          DIST: ${{ steps.config.outputs.dist_repo }}
+          TAG_P: ${{ steps.meta.outputs.tag_prefix }}
+        run: |
+          gh api "repos/${DIST}/releases" --paginate | jq -r \
+            --arg p "$TAG_P" \
+            --argjson keep 3 '
+            [.[] | select(.tag_name | startswith($p))]
+            | map(. + {_build: (.tag_name | ltrimstr($p) | split(".") | last | tonumber)})
+            | sort_by(._build) | reverse
+            | .[$keep:]
+            | .[] | "\(.id) \(.tag_name)"
+          ' | while read -r id tag; do
+            echo "Pruning: $tag"
+            gh api -X DELETE "repos/${DIST}/releases/${id}"
+            gh api -X DELETE "repos/${DIST}/git/refs/tags/${tag}" || true
+          done
+
+      - name: Archive build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.config.outputs.app_key }}-ipa
+          path: ${{ steps.meta.outputs.app_name }}.ipa
+          retention-days: 14
