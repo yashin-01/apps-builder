@@ -28,6 +28,9 @@ concurrency:
   group: dist-repo-push
   cancel-in-progress: false
 
+env:
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+
 jobs:
   build:
     runs-on: macos-15
@@ -89,7 +92,7 @@ jobs:
       - name: Setup Node runtime
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Install dependencies & compile web bundle
         run: |
