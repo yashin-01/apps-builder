@@ -236,19 +236,36 @@ jobs:
             cp "$ICON_SRC" "dist-repo/icons/${KEY}.png" || true
           fi
 
-          cat > /tmp/app-entry.json <<EOF
-          {
-            "name": "${{ steps.meta.outputs.raw_name }}",
-            "bundleIdentifier": "${{ steps.meta.outputs.app_id }}",
-            "developerName": "${DEV}",
-            "version": "${{ steps.vars.outputs.version }}",
-            "versionDate": "${{ steps.vars.outputs.date }}",
-            "downloadURL": "https://github.com/${DIST}/releases/download/${{ steps.vars.outputs.tag }}/${{ steps.meta.outputs.app_name }}.ipa",
-            "size": ${{ steps.package.outputs.size || 0 }},
-            "localizedDescription": "${DESC}",
-            "iconURL": "https://raw.githubusercontent.com/${DIST}/main/icons/${KEY}.png"
-          }
-          EOF
+          # Extraer descripción de versión / changelog para SideStore/AltStore
+          if [ -f "app-src/CHANGELOG.md" ]; then
+            VERSION_DESC=$(cat app-src/CHANGELOG.md | head -n 40)
+          else
+            VERSION_DESC=$(cd app-src && git log -1 --pretty=%B 2>/dev/null || echo "Mejoras generales y corrección de errores")
+          fi
+
+          jq -n \
+            --arg name "${{ steps.meta.outputs.raw_name }}" \
+            --arg bundleId "${{ steps.meta.outputs.app_id }}" \
+            --arg dev "${DEV}" \
+            --arg ver "${{ steps.vars.outputs.version }}" \
+            --arg date "${{ steps.vars.outputs.date }}" \
+            --arg desc "${DESC}" \
+            --arg vdesc "$VERSION_DESC" \
+            --arg url "https://github.com/${DIST}/releases/download/${{ steps.vars.outputs.tag }}/${{ steps.meta.outputs.app_name }}.ipa" \
+            --arg icon "https://raw.githubusercontent.com/${DIST}/main/icons/${KEY}.png" \
+            --argjson size "${{ steps.package.outputs.size || 0 }}" \
+            '{
+              name: $name,
+              bundleIdentifier: $bundleId,
+              developerName: $dev,
+              version: $ver,
+              versionDate: $date,
+              versionDescription: $vdesc,
+              downloadURL: $url,
+              size: $size,
+              localizedDescription: $desc,
+              iconURL: $icon
+            }' > /tmp/app-entry.json
 
           node builder-tools/scripts/merge-source.mjs dist-repo/source.json /tmp/app-entry.json
 
