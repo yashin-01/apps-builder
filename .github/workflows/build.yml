@@ -196,6 +196,58 @@ jobs:
             CURRENT_PROJECT_VERSION=${{ steps.vars.outputs.build_number }} \
             clean build
 
+      - name: Ad-hoc sign binaries to embed entitlements
+        run: |
+          APP_PATH="app-src/ios/App/build/Build/Products/Release-iphoneos/App.app"
+          
+          # 1. Sign extensions in PlugIns first (deepest to root)
+          if [ -d "$APP_PATH/PlugIns" ]; then
+            for ext in "$APP_PATH/PlugIns/"*.appex; do
+              if [ -d "$ext" ]; then
+                ext_name=$(basename "$ext" .appex)
+                echo "Buscando entitlements para extension: $ext_name"
+                ext_ent=$(find app-src/ios -name "*${ext_name}*.entitlements" | head -n 1)
+                if [ -n "$ext_ent" ] && [ -f "$ext_ent" ]; then
+                  echo "Firmando $ext con $ext_ent..."
+                  codesign -f -s - --entitlements "$ext_ent" --deep "$ext"
+                else
+                  echo "Firmando $ext ad-hoc sin entitlements especificos..."
+                  codesign -f -s - --deep "$ext"
+                fi
+              fi
+            done
+          fi
+          
+          # 2. Sign embedded frameworks
+          if [ -d "$APP_PATH/Frameworks" ]; then
+            for fw in "$APP_PATH/Frameworks/"*; do
+              if [ -e "$fw" ]; then
+                codesign -f -s - --deep "$fw" 2>/dev/null || true
+              fi
+            done
+          fi
+          
+          # 3. Sign the main App.app with its entitlements
+          app_ent=$(find app-src/ios -name "App.entitlements" | head -n 1)
+          if [ -n "$app_ent" ] && [ -f "$app_ent" ]; then
+            echo "Firmando App.app con $app_ent..."
+            codesign -f -s - --entitlements "$app_ent" "$APP_PATH"
+          else
+            echo "Firmando App.app ad-hoc..."
+            codesign -f -s - "$APP_PATH"
+          fi
+          
+          echo "=== Verificacion de Entitlements en App.app ==="
+          codesign -d --entitlements :- "$APP_PATH" || true
+          if [ -d "$APP_PATH/PlugIns" ]; then
+            for ext in "$APP_PATH/PlugIns/"*.appex; do
+              if [ -d "$ext" ]; then
+                echo "=== Verificacion de Entitlements en $(basename "$ext") ==="
+                codesign -d --entitlements :- "$ext" || true
+              fi
+            done
+          fi
+
       - name: Package distribution bundle
         id: package
         run: |
